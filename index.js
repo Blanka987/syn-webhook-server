@@ -6,18 +6,16 @@ import process from "process";
 const app = express();
 app.use(express.json({ limit: "200kb" }));
 
-// Discord webhook lagras i Railway → Variables → DISCORD_WEBHOOK
+// Discord webhook stored in Railway Variables
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
 
-// Veckans totalsummor
+// Weekly and previous totals
 let userTotals = {};
-
-// Föregående veckas summor
 let previousTotals = {};
 
 
 // -------------------------------------------------------------
-//   PARSER FÖR SYN COUNTY WEBHOOK TEXT
+// PARSE SYN COUNTY WEBHOOK TEXT
 // -------------------------------------------------------------
 function parseSynCounty(text) {
   const lines = ("" + text).split(/\r?\n/);
@@ -29,18 +27,18 @@ function parseSynCounty(text) {
   for (const raw of lines) {
     const line = raw.trim().toLowerCase();
 
-    // Hitta clan
+    // Extract clan name
     if (line.startsWith("clan name:")) {
       clan = raw.split(":")[1].trim();
     }
 
-    // Hitta materialmängd
+    // Extract material amount
     if (line.includes("materials added")) {
       const m = raw.match(/([\d]+(?:\.[\d]+)?)/);
       if (m) materials = parseFloat(m[1]);
     }
 
-    // Hitta Discord-ID (17–20 siffror)
+    // Extract Discord ID (17–20 digits)
     if (line.startsWith("discord:")) {
       const match = raw.match(/(\d{17,20})/);
       if (match) discordId = match[1];
@@ -52,7 +50,7 @@ function parseSynCounty(text) {
 
 
 // -------------------------------------------------------------
-//   ADD TO TOTALS
+// ADD TO WEEKLY TOTALS
 // -------------------------------------------------------------
 function addToTotals(discordId, amount) {
   if (!userTotals[discordId]) userTotals[discordId] = 0;
@@ -61,16 +59,25 @@ function addToTotals(discordId, amount) {
 
 
 // -------------------------------------------------------------
-//   WEBHOOK ENDPOINT — Syn County POSTAR HIT
+// DISCORD-COMPATIBLE WEBHOOK ROUTE (SYN COUNTY WILL ACCEPT THIS)
+// Looks like a real Discord webhook: /api/webhooks/:id/:token
+// -------------------------------------------------------------
+app.post("/api/webhooks/:id/:token", async (req, res) => {
+  req.url = "/syn-county";      // Forward request internally
+  app._router.handle(req, res); // Reuse our real handler
+});
+
+
+// -------------------------------------------------------------
+// MAIN WEBHOOK ENDPOINT USED INTERNALLY
 // -------------------------------------------------------------
 app.post("/syn-county", async (req, res) => {
   try {
     const text = req.body.text || "";
-
     const { clan, materials, discordId } = parseSynCounty(text);
 
     if (!discordId) {
-      console.log("❗ Ingen Discord-ID hittades i webhooken:", text);
+      console.log("❗ No Discord ID found in webhook:", text);
       return res.status(200).send("OK (no ID)");
     }
 
@@ -79,28 +86,16 @@ app.post("/syn-county", async (req, res) => {
     const current = userTotals[discordId];
     const previous = previousTotals[discordId] || 0;
 
-    // Skicka embed till Discord
+    // Send embed to Discord
     await axios.post(DISCORD_WEBHOOK, {
       embeds: [
         {
-          title: "📦 Ny material-donation",
-          description: `Clan: **${clan}**\nAnvändare: <@${discordId}>`,
+          title: "📦 New Material Donation",
+          description: `Clan: **${clan}**\nUser: <@${discordId}>`,
           fields: [
-            {
-              name: "Senaste donation",
-              value: `${materials}`,
-              inline: true
-            },
-            {
-              name: "Totalt denna vecka",
-              value: `${current}`,
-              inline: true
-            },
-            {
-              name: "Föregående vecka",
-              value: `${previous}`,
-              inline: true
-            }
+            { name: "Last Donation", value: `${materials}`, inline: true },
+            { name: "Total This Week", value: `${current}`, inline: true },
+            { name: "Previous Week", value: `${previous}`, inline: true }
           ],
           color: 3447003,
           timestamp: new Date().toISOString()
@@ -110,48 +105,47 @@ app.post("/syn-county", async (req, res) => {
 
     res.send("OK");
   } catch (err) {
-    console.error("Fel i /syn-county:", err);
+    console.error("Error in /syn-county:", err);
     res.status(500).send("Server error");
   }
 });
 
 
 // -------------------------------------------------------------
-//   AUTO-RESET FREDAG 24:00 (Lördag 00:00)
+// AUTO-RESET FRIDAY 24:00 (SATURDAY 00:00)
 // -------------------------------------------------------------
 cron.schedule("0 0 * * 6", async () => {
-  console.log("🔄 Auto-reset körs...");
+  console.log("🔄 Weekly auto-reset running...");
 
-  // Flytta denna veckas summor till previousTotals
   previousTotals = { ...userTotals };
-
-  // Nollställ veckans summor
   userTotals = {};
 
-  // Skicka sammanfattning till Discord
   await axios.post(DISCORD_WEBHOOK, {
     embeds: [
       {
-        title: "🟢 Veckan avslutad",
+        title: "🟢 Weekly Reset Complete",
         description:
-          "Veckans totalsummor har sparats som **'Föregående vecka'**.\nNya summor börjar räknas nu!",
+          "This week's totals have been stored as **Previous Week**. New totals start now!",
         timestamp: new Date().toISOString(),
         color: 15844367
       }
     ]
   });
 
-  console.log("✔ Reset klar");
+  console.log("✔ Weekly reset done");
 });
 
 
 // -------------------------------------------------------------
-//   STANDARD ROOT ENDPOINT (för att testa att servern kör)
+// HEALTH CHECK (optional)
 // -------------------------------------------------------------
 app.get("/", (req, res) => {
-  res.send("Webhook-servern körs 🚀");
+  res.send("Syn County Webhook Server is running 🚀");
 });
 
 
+// -------------------------------------------------------------
+// START SERVER
+// -------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server lyssnar på port", PORT));
+app.listen(PORT, () => console.log("Server listening on port", PORT));
