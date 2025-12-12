@@ -7,75 +7,52 @@ app.use(bodyParser.json());
 
 const DISCORD_FORWARD_WEBHOOK = process.env.DISCORD_FORWARD_WEBHOOK;
 
-function isRealDonation(text) {
-    return (
-        text.includes("Materials added") ||
-        text.includes("worth") ||
-        text.includes("added:")
-    );
+function extractDonationAmount(text) {
+  const m1 = text.match(/Materials added:? ([0-9.]+)/i);
+  const m2 = text.match(/worth ([0-9.]+)/i);
+  return m1?.[1] || m2?.[1] || null;
 }
 
 function extractUserId(text) {
-    const match = text.match(/<@(\d+)>/);
-    return match ? match[1] : null;
-}
-
-function extractDonationAmount(text) {
-    const m1 = text.match(/Materials added:\s*([0-9.]+)/i);
-    const m2 = text.match(/worth\s*([0-9.]+)/i);
-
-    return m1?.[1] || m2?.[1] || null;
+  const m = text.match(/<@(\d+)>/);
+  return m ? m[1] : null;
 }
 
 app.post("/syn-county", async (req, res) => {
-    try {
-        const embeds = req.body.embeds || [];
-        if (!embeds.length) return res.sendStatus(200);
+  const { text, embeds } = req.body;
 
-        for (const embed of embeds) {
-            const title = embed.title || "";
-            const description = embed.description || "";
+  if (!embeds || embeds.length === 0) return res.sendStatus(200);
 
-            const fullText = `${title}\n${description}`;
+  for (const embed of embeds) {
+    const title = embed.title || "";
+    const desc = embed.description || "";
 
-            console.log("Incoming webhook:");
-            console.log("Title:", title);
-            console.log(description);
+    const fullText = `${title}\n${desc}`;
 
-            // 🔥 Ignore non-donation summary embeds
-            if (!isRealDonation(fullText)) {
-                console.log("⚠ Ignored non-donation embed.");
-                continue;
-            }
+    console.log("Incoming webhook:");
+    console.log(fullText);
 
-            const userId = extractUserId(fullText);
-            const amount = extractDonationAmount(fullText);
+    const amount = extractDonationAmount(fullText);
+    const userId = extractUserId(fullText);
 
-            if (!amount) {
-                console.log("❗ No donation amount found, skipping.");
-                continue;
-            }
-
-            // Build message for Discord webhook
-            const msg = {
-                content: `**Donation processed:** <@${userId}> donated **${amount}**`
-            };
-
-            try {
-                await axios.post(DISCORD_FORWARD_WEBHOOK, msg);
-                console.log(`Processed donation: ${amount} for ${userId}`);
-            } catch (err) {
-                console.log("❗ Failed sending embed:", err.message);
-            }
-        }
-
-        res.sendStatus(200);
-    } catch (err) {
-        console.log("Server error:", err.message);
-        res.sendStatus(500);
+    if (!amount || !userId) {
+      console.log("❌ Missing amount or userId");
+      continue;
     }
+
+    try {
+      await axios.post(DISCORD_FORWARD_WEBHOOK, {
+        content: `📦 **Donation:** <@${userId}> added **${amount}** materials.`
+      });
+      console.log("✔ Processed donation:", amount);
+    } catch (err) {
+      console.log("❌ Discord send failed:", err.message);
+    }
+  }
+
+  res.sendStatus(200);
 });
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log("Syn County webhook server running.");
+  console.log("Syn County webhook server running.");
 });
