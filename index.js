@@ -1,151 +1,131 @@
 import express from "express";
 import axios from "axios";
-import cron from "node-cron";
-import process from "process";
+import bodyParser from "body-parser";
+import fs from "fs";
 
 const app = express();
-app.use(express.json({ limit: "200kb" }));
+app.use(bodyParser.json());
 
-// Discord webhook stored in Railway Variables
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
+const WEBHOOK = process.env.DISCORD_WEBHOOK;
 
-// Weekly and previous totals
-let userTotals = {};
-let previousTotals = {};
-
-
-// -------------------------------------------------------------
-// PARSE SYN COUNTY WEBHOOK TEXT
-// -------------------------------------------------------------
-function parseSynCounty(text) {
-  const lines = ("" + text).split(/\r?\n/);
-
-  let clan = "";
-  let materials = 0;
-  let discordId = "";
-
-  for (const raw of lines) {
-    const line = raw.trim().toLowerCase();
-
-    // Extract clan name
-    if (line.startsWith("clan name:")) {
-      clan = raw.split(":")[1].trim();
+// Load or initialize storage
+let db = { users: {}, previousWeek: {} };
+if (fs.existsSync("data.json")) {
+    try {
+        db = JSON.parse(fs.readFileSync("data.json"));
+    } catch (e) {
+        console.error("Failed to load data.json, starting new DB.");
     }
-
-    // Extract material amount
-    if (line.includes("materials added")) {
-      const m = raw.match(/([\d]+(?:\.[\d]+)?)/);
-      if (m) materials = parseFloat(m[1]);
-    }
-
-    // Extract Discord ID (17–20 digits)
-    if (line.startsWith("discord:")) {
-      const match = raw.match(/(\d{17,20})/);
-      if (match) discordId = match[1];
-    }
-  }
-
-  return { clan, materials, discordId };
 }
 
-
-// -------------------------------------------------------------
-// ADD TO WEEKLY TOTALS
-// -------------------------------------------------------------
-function addToTotals(discordId, amount) {
-  if (!userTotals[discordId]) userTotals[discordId] = 0;
-  userTotals[discordId] += amount;
+// Save function
+function saveDB() {
+    fs.writeFileSync("data.json", JSON.stringify(db, null, 2));
 }
 
+// Extract numeric ID (18–20 digits)
+function extractDiscordId(text) {
+    const match = text.match(/\b\d{17,20}\b/);
+    return match ? match[0] : null;
+}
 
-// -------------------------------------------------------------
-// DISCORD-COMPATIBLE WEBHOOK ROUTE (SYN COUNTY WILL ACCEPT THIS)
-// Looks like a real Discord webhook: /api/webhooks/:id/:token
-// -------------------------------------------------------------
-app.post("/api/webhooks/:id/:token", async (req, res) => {
-  req.url = "/syn-county";      // Forward request internally
-  app._router.handle(req, res); // Reuse our real handler
-});
+// Extract material amount
+function extractAmount(text) {
+    const match = text.match(/(?:Materials added|worth)\s*[: ]\s*([\d.]+)/i);
 
+    if (!match) return 0;
+    return parseFloat(match[1]);
+}
 
-// -------------------------------------------------------------
-// MAIN WEBHOOK ENDPOINT USED INTERNALLY
-// -------------------------------------------------------------
+// Extract clan
+function extractClan(text) {
+    const match = text.match(/Clan Name:\s*([A-Za-z0-9_]+)/i);
+    return match ? match[1] : "Unknown";
+}
+
 app.post("/syn-county", async (req, res) => {
-  try {
     const text = req.body.text || "";
-    const { clan, materials, discordId } = parseSynCounty(text);
+    console.log("Incoming webhook:\n" + text);
 
+    // 1. Get Discord ID
+    const discordId = extractDiscordId(text);
     if (!discordId) {
-      console.log("❗ No Discord ID found in webhook:", text);
-      return res.status(200).send("OK (no ID)");
+        console.log("! No Discord ID found in webhook!");
+        return res.status(400).send("Missing Discord ID");
     }
 
-    addToTotals(discordId, materials);
+    // 2. Get donation
+    const amount = extractAmount(text);
 
-    const current = userTotals[discordId];
-    const previous = previousTotals[discordId] || 0;
+    // 3. Get clan
+    const clan = extractClan(text);
+
+    // Initialize user
+    if (!db.users[discordId]) {
+        db.users[discordId] = {
+            clan,
+            totalWeek: 0
+        };
+    }
+
+    db.users[discordId].clan = clan;
+    db.users[discordId].totalWeek += amount;
+
+    saveDB();
+
+    const userTotal = db.users[discordId].totalWeek;
+    const prev = db.previousWeek[discordId] || 0;
 
     // Send embed to Discord
-    await axios.post(DISCORD_WEBHOOK, {
-      embeds: [
-        {
-          title: "📦 New Material Donation",
-          description: `Clan: **${clan}**\nUser: <@${discordId}>`,
-          fields: [
-            { name: "Last Donation", value: `${materials}`, inline: true },
-            { name: "Total This Week", value: `${current}`, inline: true },
-            { name: "Previous Week", value: `${previous}`, inline: true }
-          ],
-          color: 3447003,
-          timestamp: new Date().toISOString()
+    try {
+        await axios.post(WEBHOOK, {
+            embeds: [
+                {
+                    title: "📦 New Material Donation",
+                    color: 0xffcc00,
+                    fields: [
+                        { name: "Clan", value: clan, inline: true },
+                        { name: "User", value: `<@${discordId}>`, inline: true },
+                        { name: "Last Donation", value: amount.toString(), inline: false },
+                        {
+                            name: "Totals",
+                            value: `This Week: **${userTotal}**\nPrevious Week: **${prev}**`,
+                            inline: false
+                        }
+                    ],
+                    timestamp: new Date().toISOString()
+                }
+            ]
+        });
+
+        console.log(`Processed donation: ${amount} for ${discordId}`);
+
+        res.send("OK");
+    } catch (e) {
+        console.error("Failed sending embed:", e.message);
+        res.status(500).send("Failed");
+    }
+});
+
+// Weekly reset every Friday at 00:00
+setInterval(() => {
+    const date = new Date();
+    const isFriday = date.getDay() === 5;
+    const isMidnight = date.getHours() === 0 && date.getMinutes() === 0;
+
+    if (isFriday && isMidnight) {
+        console.log("Weekly reset triggered.");
+
+        // Move totals to previousWeek
+        for (const id in db.users) {
+            db.previousWeek[id] = db.users[id].totalWeek;
+            db.users[id].totalWeek = 0;
         }
-      ]
-    });
 
-    res.send("OK");
-  } catch (err) {
-    console.error("Error in /syn-county:", err);
-    res.status(500).send("Server error");
-  }
-});
+        saveDB();
+    }
+}, 60 * 1000); // Check every minute
 
-
-// -------------------------------------------------------------
-// AUTO-RESET FRIDAY 24:00 (SATURDAY 00:00)
-// -------------------------------------------------------------
-cron.schedule("0 0 * * 6", async () => {
-  console.log("🔄 Weekly auto-reset running...");
-
-  previousTotals = { ...userTotals };
-  userTotals = {};
-
-  await axios.post(DISCORD_WEBHOOK, {
-    embeds: [
-      {
-        title: "🟢 Weekly Reset Complete",
-        description:
-          "This week's totals have been stored as **Previous Week**. New totals start now!",
-        timestamp: new Date().toISOString(),
-        color: 15844367
-      }
-    ]
-  });
-
-  console.log("✔ Weekly reset done");
-});
-
-
-// -------------------------------------------------------------
-// HEALTH CHECK (optional)
-// -------------------------------------------------------------
-app.get("/", (req, res) => {
-  res.send("Syn County Webhook Server is running 🚀");
-});
-
-
-// -------------------------------------------------------------
-// START SERVER
-// -------------------------------------------------------------
+// Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server listening on port", PORT));
+app.listen(PORT, () => console.log("Syn webhook server running on port", PORT));
