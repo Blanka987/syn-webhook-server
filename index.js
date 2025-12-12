@@ -55,4 +55,6 @@ app.post("/syn-county", async (req, res) => {
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Syn County webhook server running.");
+  console.log("Webhook ENV:", `"${process.env.DISCORD_WEBHOOK}"`);
+
 });
